@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 from models import ServiceStatus
+from console_manager import console_manager # <--- IMPORT THE NEW MANAGER
 
 # --- Color formatting for console output ---
 class TColors:
@@ -41,7 +42,9 @@ def print_orchestrator(message, level="info"):
         "warn": TColors.WARNING,
         "error": TColors.FAIL
     }.get(level, TColors.OKGREEN)
-    print(f"{color}{TColors.BOLD}[Orchestrator] {message}{TColors.ENDC}")
+    prefix = f"{color}{TColors.BOLD}[Orchestrator]{TColors.ENDC} "
+    # Use the console manager, giving it a unique name
+    console_manager.print("Orchestrator", message, prefix)
 
 class ProcessInfo:
     """Holds all state for a single managed process."""
@@ -90,7 +93,8 @@ class ProcessManager:
         try:
             # Read line by line from the process's stdout
             for line in iter(popen_obj.stdout.readline, ''):
-                print(f"{prefix}{line.strip()}", flush=True)
+                if line: # Avoid printing empty lines
+                    console_manager.print(process_name, line, prefix)
             popen_obj.stdout.close()
         except Exception as e:
             print_orchestrator(f"Log forwarder for '{process_name}' crashed: {e}", level="error")
