@@ -4,9 +4,14 @@ import signal
 import threading
 import time
 import yaml
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+
+# Conditionally import pty for TTY emulation on Unix-like systems
+if sys.platform != "win32":
+    import pty
 
 from models import ServiceStatus
 from console_manager import console_manager # <--- IMPORT THE NEW MANAGER
@@ -83,7 +88,7 @@ class ProcessManager:
         # Wait for the thread to finish
         self._monitor_thread.join(timeout=2)
 
-    def _log_forwarder(self, process_name: str, group_id: str, popen_obj: subprocess.Popen):
+    def _log_forwarder(self, process_name: str, group_id: str, output_stream):
         """Reads a subprocess's output and prints it, line by line with group-specific color."""
         # Consistently select a color based on the group_id hash
         color_index = hash(group_id) % len(TColors.GROUP_COLORS)
@@ -91,13 +96,17 @@ class ProcessManager:
         # Build the prefix using the selected color for the tag
         prefix = f"{TColors.BOLD}{group_color}[{process_name}]{TColors.ENDC} "
         try:
-            # Read line by line from the process's stdout
-            for line in iter(popen_obj.stdout.readline, ''):
+            # Read line by line from the provided output stream
+            for line in iter(output_stream.readline, ''):
                 if line: # Avoid printing empty lines
                     console_manager.print(process_name, line, prefix)
-            popen_obj.stdout.close()
         except Exception as e:
-            print_orchestrator(f"Log forwarder for '{process_name}' crashed: {e}", level="error")
+            # The stream might be closed abruptly, which can cause an exception.
+            # We can often ignore it, but we log it for debugging.
+            print_orchestrator(f"Log forwarder for '{process_name}' exception: {e}", level="warn")
+        finally:
+            # Ensure the stream is closed to release resources.
+            output_stream.close()
 
     def _start_single_service(self, info: ProcessInfo) -> bool:
         """Internal method to start one service and its log forwarder."""
@@ -108,11 +117,21 @@ class ProcessManager:
             
             print_orchestrator(f"Starting service '{service_name}' in '{working_dir}'...")
 
+            # Use a pseudo-terminal (pty) on Unix to make the child process
+            # think it's in an interactive session. This is crucial for tools
+            # like tqdm that change their output when piped.
+            if sys.platform != "win32":
+                master_fd, slave_fd = pty.openpty()
+                stdout_target = slave_fd
+            else:
+                # pty is not available on Windows, fall back to standard pipe.
+                stdout_target = subprocess.PIPE
+
             # Start the subprocess
             info.popen = subprocess.Popen(
                 config['script'],
                 cwd=working_dir,
-                stdout=subprocess.PIPE,
+                stdout=stdout_target,
                 stderr=subprocess.STDOUT, # Redirect stderr to stdout
                 text=True,
                 bufsize=1, # Line-buffered
@@ -120,10 +139,17 @@ class ProcessManager:
                 preexec_fn=os.setsid # Crucial for creating a process group
             )
             
+            # Prepare the stream that the log forwarder will read from.
+            if sys.platform != "win32":
+                os.close(slave_fd)  # Close the slave fd in the parent
+                log_stream = os.fdopen(master_fd, 'r')
+            else:
+                log_stream = info.popen.stdout
+
             # Start the log forwarding thread
             info.log_thread = threading.Thread(
                 target=self._log_forwarder,
-                args=(service_name, info.group_id, info.popen),
+                args=(service_name, info.group_id, log_stream),
                 daemon=True
             )
             info.log_thread.start()
