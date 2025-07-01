@@ -14,7 +14,7 @@ if sys.platform != "win32":
     import pty
 
 from models import ServiceStatus
-from console_manager import console_manager # <--- IMPORT THE NEW MANAGER
+from console_manager import console_manager
 
 # --- Color formatting for console output ---
 class TColors:
@@ -49,7 +49,7 @@ def print_orchestrator(message, level="info"):
     }.get(level, TColors.OKGREEN)
     prefix = f"{color}{TColors.BOLD}[Orchestrator]{TColors.ENDC} "
     # Use the console manager, giving it a unique name
-    console_manager.print("Orchestrator", message, prefix)
+    console_manager.print("Orchestrator", message + "\n", prefix) # Add newline for orchestrator logs
 
 class ProcessInfo:
     """Holds all state for a single managed process."""
@@ -88,26 +88,44 @@ class ProcessManager:
         # Wait for the thread to finish
         self._monitor_thread.join(timeout=2)
 
-    def _log_forwarder(self, process_name: str, group_id: str, output_stream):
-        """Reads a subprocess's output and prints it, line by line with group-specific color."""
+    def _log_forwarder(self, process_name: str, group_id: str, pty_master_fd: Optional[int], popen_instance: subprocess.Popen):
+        """
+        Reads raw output from a process and forwards it to the console manager.
+        This function reads in chunks to handle interactive output like progress bars correctly.
+        """
         # Consistently select a color based on the group_id hash
         color_index = hash(group_id) % len(TColors.GROUP_COLORS)
         group_color = TColors.GROUP_COLORS[color_index]
         # Build the prefix using the selected color for the tag
         prefix = f"{TColors.BOLD}{group_color}[{process_name}]{TColors.ENDC} "
-        try:
-            # Read line by line from the provided output stream
-            for line in iter(output_stream.readline, ''):
-                if line: # Avoid printing empty lines
-                    console_manager.print(process_name, line, prefix)
-        except Exception as e:
-            # The stream might be closed abruptly, which can cause an exception.
-            # We can often ignore it, but we log it for debugging.
-            print_orchestrator(f"Log forwarder for '{process_name}' exception: {e}", level="warn")
-        finally:
-            # Ensure the stream is closed to release resources.
-            output_stream.close()
 
+        # Use the pty file descriptor on Unix, otherwise use the process's stdout pipe
+        stream = pty_master_fd if pty_master_fd is not None else popen_instance.stdout.fileno()
+
+        try:
+            while True:
+                # Read in small chunks to get real-time updates.
+                # This is non-blocking on pty and will capture \r immediately.
+                raw_output = os.read(stream, 1024)
+                if not raw_output:
+                    # An empty read means the other end of the pipe was closed.
+                    break
+                
+                # Decode the bytes into a string, replacing any malformed characters.
+                message = raw_output.decode('utf-8', errors='replace')
+                if message:
+                    console_manager.print(process_name, message, prefix)
+
+        except (IOError, OSError) as e:
+            # This can happen if the process closes abruptly.
+            print_orchestrator(f"Log forwarder for '{process_name}' stopped due to IO error: {e}", level="warn")
+        finally:
+            # Clean up resources
+            if pty_master_fd is not None:
+                os.close(pty_master_fd)
+            elif popen_instance.stdout:
+                popen_instance.stdout.close()
+    
     def _start_single_service(self, info: ProcessInfo) -> bool:
         """Internal method to start one service and its log forwarder."""
         try:
@@ -117,45 +135,39 @@ class ProcessManager:
             
             print_orchestrator(f"Starting service '{service_name}' in '{working_dir}'...")
 
-            # Use a pseudo-terminal (pty) on Unix to make the child process
-            # think it's in an interactive session. This is crucial for tools
-            # like tqdm that change their output when piped.
+            pty_master_fd = None # Default for Windows
             if sys.platform != "win32":
                 master_fd, slave_fd = pty.openpty()
                 stdout_target = slave_fd
+                pty_master_fd = master_fd
             else:
                 # pty is not available on Windows, fall back to standard pipe.
                 stdout_target = subprocess.PIPE
 
-            # Start the subprocess
             info.popen = subprocess.Popen(
                 config['script'],
                 cwd=working_dir,
                 stdout=stdout_target,
-                stderr=subprocess.STDOUT, # Redirect stderr to stdout
-                text=True,
-                bufsize=1, # Line-buffered
-                shell=True, # Allows './run.sh' syntax
-                preexec_fn=os.setsid # Crucial for creating a process group
+                stderr=subprocess.STDOUT,
+                text=True if sys.platform == "win32" else False, # text=False for raw bytes with PTY
+                bufsize=1,
+                shell=True,
+                preexec_fn=os.setsid if sys.platform != "win32" else None
             )
             
-            # Prepare the stream that the log forwarder will read from.
             if sys.platform != "win32":
-                os.close(slave_fd)  # Close the slave fd in the parent
-                log_stream = os.fdopen(master_fd, 'r')
-            else:
-                log_stream = info.popen.stdout
+                os.close(stdout_target) # Close the slave fd in the parent
 
             # Start the log forwarding thread
             info.log_thread = threading.Thread(
                 target=self._log_forwarder,
-                args=(service_name, info.group_id, log_stream),
+                args=(service_name, info.group_id, pty_master_fd, info.popen),
                 daemon=True
             )
             info.log_thread.start()
             
             info.start_time = datetime.now()
-            info.manually_stopped = False # Reset flag on start
+            info.manually_stopped = False
             self.running_processes[service_name] = info
             
             print_orchestrator(f"Service '{service_name}' started with PID {info.popen.pid}.", level="info")
@@ -174,15 +186,24 @@ class ProcessManager:
         info.manually_stopped = True # Mark for monitor to ignore
         
         try:
-            # Send SIGINT to the entire process group
-            os.killpg(os.getpgid(info.popen.pid), signal.SIGINT)
+            if sys.platform != "win32":
+                os.killpg(os.getpgid(info.popen.pid), signal.SIGINT)
+            else:
+                # Windows does not support process groups well, send CTRL+BREAK
+                info.popen.send_signal(signal.CTRL_BREAK_EVENT)
+            
             info.popen.wait(timeout=10)
             print_orchestrator(f"Service '{service_name}' stopped gracefully.")
         except subprocess.TimeoutExpired:
-            print_orchestrator(f"Service '{service_name}' did not stop gracefully, sending SIGKILL.", level="warn")
-            os.killpg(os.getpgid(info.popen.pid), signal.SIGKILL)
+            print_orchestrator(f"Service '{service_name}' did not stop gracefully, sending SIGKILL/Terminate.", level="warn")
+            if sys.platform != "win32":
+                os.killpg(os.getpgid(info.popen.pid), signal.SIGKILL)
+            else:
+                info.popen.terminate()
         except ProcessLookupError:
             print_orchestrator(f"Process for '{service_name}' already gone.", level="warn")
+        except Exception as e:
+             print_orchestrator(f"Error stopping process '{service_name}': {e}", level="error")
         finally:
             # The log thread will exit automatically when the pipe closes
             if service_name in self.running_processes:
